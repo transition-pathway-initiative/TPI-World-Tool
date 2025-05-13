@@ -1,0 +1,179 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>Sector Time Series POC</title>
+  <!-- ArcGIS API for JavaScript -->
+  <link rel="stylesheet" href="https://js.arcgis.com/4.29/esri/themes/light/main.css">
+  <script src="https://js.arcgis.com/4.29/"></script>
+  <!-- D3 v7 -->
+  <script src="https://d3js.org/d3.v7.min.js"></script>
+  <style>
+    html, body { margin:0; padding:0; height:100%; }
+    #viewDiv { position:absolute; top:0; left:0; right:0; height:50%; }
+    #chartDiv { position:absolute; bottom:0; left:0; right:0; top:50%; overflow-y:auto; background:#fafafa; padding:8px; }
+    .sector-chart { margin-bottom:24px; }
+  </style>
+</head>
+<body>
+  <div id="viewDiv"></div>
+  <div id="chartDiv"><em>Click a country to load charts…</em></div>
+  <script>
+    require([
+      "esri/Map", "esri/views/MapView",
+      "esri/layers/FeatureLayer"
+    ], function(Map, MapView, FeatureLayer) {
+
+      // ─── Configuration ───────────────────────────────────────────────────────
+      const POLYGON_LAYER_URL   = "https://services9.arcgis.com/iURuflZfvm4fwi34/arcgis/rest/services/ascor2024/FeatureServer/9";
+      const ALIGNMENT_LAYER_URL = "https://services9.arcgis.com/iURuflZfvm4fwi34/arcgis/rest/services/2050_Alignment_Full_Universe/FeatureServer/0";
+      // ───────────────────────────────────────────────────────────────────────────
+
+      const map = new Map({ basemap: "gray-vector" });
+      const view = new MapView({
+        container: "viewDiv",
+        map: map,
+        center: [0,20],
+        zoom: 2
+      });
+
+      const polygonLayer   = new FeatureLayer({ url: POLYGON_LAYER_URL });
+      const alignmentLayer = new FeatureLayer({ url: ALIGNMENT_LAYER_URL });
+      map.addMany([polygonLayer, alignmentLayer]);
+
+      view.on("click", async event => {
+        // 1) Hit-test country
+        const hit = await view.hitTest(event, { include: polygonLayer });
+        if (!hit.results.length) return;
+        const attrs = hit.results[0].graphic.attributes;
+        const country = attrs.Country;
+        const netZeroYear = Number(attrs["metric EP#3#a#i"]) || 2050;
+
+        // 2) Query companies for that country
+        const query = alignmentLayer.createQuery();
+        query.where = `Country='${country.replace(/'/g,"''")}'`;
+        query.outFields = ["Sector","Company Name", 
+          ...Array.from({length:2050-2013+1},(_,i)=>String(2013+i))];
+        const result = await alignmentLayer.queryFeatures(query);
+
+        // 3) Clear old charts
+        const chartDiv = document.getElementById("chartDiv");
+        chartDiv.innerHTML = "";
+
+        if (!result.features.length) {
+          chartDiv.innerHTML = `<p>No data for <b>${country}</b></p>`;
+          return;
+        }
+
+        // 4) Group by sector
+        const bySector = {};
+        result.features.forEach(f => {
+          const a = f.attributes;
+          const sector = a.Sector || "Unknown";
+          const series = [];
+          for (let y=2013; y<=2050; y++) {
+            series.push({ year: y, value: +a[String(y)] });
+          }
+          if (!bySector[sector]) bySector[sector] = [];
+          bySector[sector].push({
+            name: a["Company Name"] || "N/A",
+            values: series
+          });
+        });
+
+        // 5) Draw per‐sector mini-charts
+        Object.entries(bySector).forEach(([sector, companies]) => {
+          const container = document.createElement("div");
+          container.classList.add("sector-chart");
+          chartDiv.appendChild(container);
+
+          // Title
+          const title = document.createElement("h4");
+          title.textContent = sector;
+          title.style.margin = "0 0 4px";
+          container.appendChild(title);
+
+          // SVG
+          const svg = d3.select(container)
+            .append("svg")
+              .attr("width", 360)
+              .attr("height", 200);
+
+          const margin = { top: 20, right: 40, bottom: 30, left: 40 };
+          const w = +svg.attr("width")  - margin.left - margin.right;
+          const h = +svg.attr("height") - margin.top  - margin.bottom;
+          const g = svg.append("g")
+            .attr("transform", `translate(${margin.left},${margin.top})`);
+
+          // Scales
+          const x = d3.scaleLinear()
+            .domain([2013, Math.max(netZeroYear,2050)])
+            .range([0, w]);
+          const allVals = companies.flatMap(c => c.values.map(d => d.value));
+          const y = d3.scaleLinear()
+            .domain([0, d3.max(allVals)])
+            .nice()
+            .range([h, 0]);
+
+          // Axes
+          g.append("g")
+            .attr("transform", `translate(0,${h})`)
+            .call(d3.axisBottom(x).ticks(4).tickFormat(d3.format("d")));
+          g.append("g")
+            .call(d3.axisLeft(y).ticks(4));
+
+          // Net-zero line + label
+          g.append("line")
+            .attr("x1", x(netZeroYear)).attr("x2", x(netZeroYear))
+            .attr("y1", 0).attr("y2", h)
+            .attr("stroke", "#888").attr("stroke-dasharray","4,2");
+          g.append("text")
+            .attr("x", x(netZeroYear)+4).attr("y", 12)
+            .text(`Net-zero ${netZeroYear}`)
+            .style("font-size","8px").style("fill","#555");
+
+          // Tooltip
+          const tooltip = d3.select(container)
+            .append("div")
+              .style("position","absolute")
+              .style("visibility","hidden")
+              .style("background","white")
+              .style("border","1px solid #ccc")
+              .style("padding","4px")
+              .style("font-size","10px");
+
+          const lineGen = d3.line()
+            .x(d => x(d.year)).y(d => y(d.value));
+
+          // Company lines
+          companies.forEach(c => {
+            g.append("path")
+              .datum(c.values)
+              .attr("d", lineGen)
+              .attr("fill","none")
+              .attr("stroke","#ccc")
+              .attr("stroke-width",1)
+              .on("mouseover", () => tooltip.text(c.name).style("visibility","visible"))
+              .on("mousemove", e => tooltip
+                .style("top",(e.pageY-20)+"px")
+                .style("left",(e.pageX+10)+"px"))
+              .on("mouseout", () => tooltip.style("visibility","hidden"));
+          });
+
+          // Sector mean
+          const meanSeries = companies[0].values.map((_,i) => ({
+            year: companies[0].values[i].year,
+            value: d3.mean(companies, c => c.values[i].value)
+          }));
+          g.append("path")
+            .datum(meanSeries)
+            .attr("d", lineGen)
+            .attr("fill","none")
+            .attr("stroke","orange")
+            .attr("stroke-width",2);
+        });
+      });
+    });
+  </script>
+</body>
+</html>
